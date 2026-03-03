@@ -152,8 +152,6 @@ class SQLDatabaseToolkit:
                 cursor.execute("SELECT COUNT(DISTINCT name) FROM sqlite_master WHERE type='table'")
                 schema["statistics"]["table_count"] = cursor.fetchone()[0]
                 
-                cursor.execute("SELECT SUM(COUNT(*)) FROM (SELECT COUNT(*) FROM sqlite_master WHERE type='table' UNION ALL SELECT COUNT(*) FROM pragma_table_list())")
-                
         except sqlite3.Error as e:
             raise sqlite3.Error(f"Schema analysis failed: {str(e)}")
         
