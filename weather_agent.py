@@ -2,8 +2,8 @@
 """
 Weather Agent Script
 
-A LangChain-based agent that searches for current weather information using DuckDuckGo Search
-and provides summarized weather reports for specified cities.
+A simplified weather agent that uses DuckDuckGo Search to find current weather information
+and OpenAI for intelligent summarization.
 
 Author: [Your Name]
 Date: March 2026
@@ -11,80 +11,113 @@ Date: March 2026
 
 import asyncio
 import sys
+import os
+import requests
 from typing import Optional, Dict, Any
 import argparse
 
-from langchain.agents import AgentExecutor, create_openai_tools_agent
 from langchain_openai import ChatOpenAI
+from langchain_community.llms import Ollama
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.tools import Tool
-from langchain_duckduckgo_search import DuckDuckGoSearchRun
-from langchain_core.messages import SystemMessage
+from ddgs import DDGS
+import warnings
+
+# Suppress deprecation warnings for cleaner output
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
 class WeatherAgent:
     """
     A weather information agent that uses DuckDuckGo Search to find current weather data
-    and LangChain for intelligent summarization.
+    and either OpenAI or Ollama for intelligent summarization.
     
     Attributes:
         llm: The language model for processing and summarization
-        search_tool: DuckDuckGo search tool for web queries
-        agent_executor: LangChain agent executor for running the agent
+        ddgs: DuckDuckGo search instance
+        model_type: Type of model being used ('openai' or 'ollama')
     """
     
-    def __init__(self, openai_api_key: str, model_name: str = "gpt-3.5-turbo") -> None:
+    @staticmethod
+    def check_ollama_connection(model_name: str = "llama2") -> bool:
         """
-        Initialize the WeatherAgent with OpenAI API key and model.
+        Check if Ollama is running and the specified model is available.
         
         Args:
-            openai_api_key: OpenAI API key for language model access
+            model_name: Name of the Ollama model to check
+            
+        Returns:
+            True if Ollama is accessible and model is available, False otherwise
+        """
+        try:
+            # Check if Ollama is running
+            response = requests.get("http://localhost:11434/api/tags", timeout=5)
+            if response.status_code != 200:
+                return False
+            
+            # Check if the specific model is available
+            models = response.json().get("models", [])
+            model_names = [model["name"] for model in models]  # Use full name including tag
+            
+            if model_name not in model_names:
+                print(f"Model '{model_name}' not found. Available models: {', '.join(model_names)}")
+                print(f"Run: ollama pull {model_name}")
+                return False
+            
+            return True
+            
+        except requests.exceptions.RequestException:
+            return False
+    
+    def __init__(self, openai_api_key: Optional[str] = None, model_name: str = "gpt-3.5-turbo", use_ollama: bool = False, ollama_model: str = "llama2") -> None:
+        """
+        Initialize the WeatherAgent with either OpenAI or Ollama.
+        
+        Args:
+            openai_api_key: OpenAI API key (required if use_ollama is False)
             model_name: Name of the OpenAI model to use (default: gpt-3.5-turbo)
+            use_ollama: Whether to use Ollama instead of OpenAI (default: False)
+            ollama_model: Name of the Ollama model to use (default: llama2)
         
         Raises:
-            ValueError: If openai_api_key is None or empty
+            ValueError: If OpenAI API key is required but not provided
         """
-        if not openai_api_key:
-            raise ValueError("OpenAI API key is required")
+        if use_ollama:
+            # Check Ollama connection and model availability
+            if not WeatherAgent.check_ollama_connection(ollama_model):
+                raise ConnectionError(f"Cannot connect to Ollama or model '{ollama_model}' not available. Make sure Ollama is running and the model is downloaded.")
             
-        self.llm = ChatOpenAI(
-            model=model_name,
-            api_key=openai_api_key,
-            temperature=0.1  # Low temperature for consistent weather reports
-        )
-        
-        # Initialize DuckDuckGo search tool
-        self.search_tool = DuckDuckGoSearchRun()
-        
-        # Create tools for the agent
-        tools = [
-            Tool(
-                name="weather_search",
-                description="Search for current weather information for a specific city",
-                func=self._search_weather
+            self.llm = Ollama(model=ollama_model)
+            self.model_type = "ollama"
+        else:
+            if not openai_api_key:
+                raise ValueError("OpenAI API key is required when not using Ollama")
+            self.llm = ChatOpenAI(
+                model=model_name,
+                api_key=openai_api_key,
+                temperature=0.1  # Low temperature for consistent weather reports
             )
-        ]
+            self.model_type = "openai"
         
-        # Create the prompt template
-        prompt = ChatPromptTemplate.from_messages([
-            SystemMessage(content="""You are a helpful weather assistant. When given a city name, 
-            search for current weather information and provide a clear, concise summary including:
-            - Current temperature
-            - Weather conditions (sunny, cloudy, rainy, etc.)
-            - Humidity
-            - Wind speed/direction
-            - Any weather alerts or warnings
-            
-            Always cite your sources and be specific about the current conditions."""),
-            ("human", "{input}"),
-            ("placeholder", "{agent_scratchpad}")
-        ])
+        # Initialize DuckDuckGo search
+        self.ddgs = DDGS()
         
-        # Create the agent
-        agent = create_openai_tools_agent(self.llm, tools, prompt)
-        self.agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+        # Create the summarization prompt
+        self.prompt = ChatPromptTemplate.from_template("""
+        You are a helpful weather assistant. Based on the following search results about weather in {city},
+        provide a clear, concise summary including:
+        - Current temperature
+        - Weather conditions (sunny, cloudy, rainy, etc.)
+        - Humidity
+        - Wind speed/direction
+        - Any weather alerts or warnings
+        
+        Search Results:
+        {search_results}
+        
+        Please provide a comprehensive weather summary for {city}:
+        """)
     
-    def _search_weather(self, city: str) -> str:
+    def search_weather(self, city: str) -> str:
         """
         Search for weather information for a given city using DuckDuckGo.
         
@@ -94,8 +127,15 @@ class WeatherAgent:
         Returns:
             Raw search results as a string
         """
-        search_query = f"current weather in {city} today temperature conditions"
-        return self.search_tool.run(search_query)
+        search_query = f"current weather in {city} today temperature conditions humidity wind"
+        try:
+            results = list(self.ddgs.text(search_query, max_results=5))
+            if results:
+                return "\n".join([f"{result['title']}: {result['body']}" for result in results])
+            else:
+                return f"No weather information found for {city}"
+        except Exception as e:
+            return f"Error searching for weather: {str(e)}"
     
     async def get_weather_summary(self, city: str) -> Dict[str, Any]:
         """
@@ -111,23 +151,31 @@ class WeatherAgent:
             Exception: If there's an error during weather search or summarization
         """
         try:
-            # Construct the query for the agent
-            query = f"Please provide a detailed weather summary for {city}, including current temperature, conditions, humidity, and wind information."
+            # Search for weather information
+            search_results = self.search_weather(city)
             
-            # Execute the agent
-            result = await self.agent_executor.ainvoke({"input": query})
+            # Create the prompt chain
+            chain = self.prompt | self.llm
+            
+            # Generate the summary
+            response = await chain.ainvoke({
+                "city": city,
+                "search_results": search_results
+            })
             
             return {
                 "city": city,
-                "summary": result.get("output", ""),
+                "summary": response.content if hasattr(response, 'content') else str(response),
+                "search_results": search_results,
                 "success": True,
-                "source": "DuckDuckGo Search + OpenAI"
+                "source": f"DuckDuckGo Search + {self.model_type.upper()}"
             }
             
         except Exception as e:
             return {
                 "city": city,
                 "summary": f"Error retrieving weather information: {str(e)}",
+                "search_results": "",
                 "success": False,
                 "source": "Error"
             }
@@ -170,23 +218,45 @@ def main() -> None:
         help="OpenAI model to use (default: gpt-3.5-turbo)",
         default="gpt-3.5-turbo"
     )
+    parser.add_argument(
+        "--use-ollama", 
+        help="Use Ollama instead of OpenAI (requires Ollama to be running locally)",
+        action="store_true"
+    )
+    parser.add_argument(
+        "--ollama-model", 
+        help="Ollama model to use (default: llama2)",
+        default="llama2"
+    )
     
     args = parser.parse_args()
     
-    # Get API key from argument or environment
-    api_key = args.api_key
-    if not api_key:
-        import os
-        api_key = os.getenv("OPENAI_API_KEY")
-    
-    if not api_key:
-        print("Error: OpenAI API key is required. Provide it via --api-key argument or OPENAI_API_KEY environment variable.")
-        sys.exit(1)
+    # Check if using Ollama
+    if args.use_ollama:
+        print("Using Ollama for local LLM processing...")
+        api_key = None
+    else:
+        # Get API key from argument or environment
+        api_key = args.api_key
+        if not api_key:
+            api_key = os.getenv("OPENAI_API_KEY")
+        
+        if not api_key:
+            print("Error: OpenAI API key is required when not using Ollama.")
+            print("Either:")
+            print("  1. Provide it via --api-key argument")
+            print("  2. Set OPENAI_API_KEY environment variable")
+            print("  3. Use --use-ollama flag for local processing")
+            sys.exit(1)
     
     try:
         # Initialize the weather agent
-        print(f"Initializing weather agent for {args.city}...")
-        agent = WeatherAgent(openai_api_key=api_key, model_name=args.model)
+        if args.use_ollama:
+            print(f"Initializing weather agent for {args.city} with Ollama ({args.ollama_model})...")
+            agent = WeatherAgent(use_ollama=True, ollama_model=args.ollama_model)
+        else:
+            print(f"Initializing weather agent for {args.city} with OpenAI ({args.model})...")
+            agent = WeatherAgent(openai_api_key=api_key, model_name=args.model)
         
         # Get weather summary
         print(f"Searching for weather information in {args.city}...")
@@ -202,6 +272,10 @@ def main() -> None:
         print("-"*40)
         print(result['summary'])
         print("-"*40)
+        
+        if not result['success']:
+            print(f"\nDebug Info - Search Results:")
+            print(result.get('search_results', 'No search results available'))
         
     except Exception as e:
         print(f"Error: {str(e)}")
